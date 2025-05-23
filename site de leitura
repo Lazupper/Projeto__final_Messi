@@ -1,0 +1,946 @@
+# app.py
+
+from flask import Flask, render_template, url_for, flash, redirect, request
+from config import Config
+from models import db, User, Story, Comment
+from forms import RegistrationForm, LoginForm, StoryForm, CommentForm
+from flask_login import LoginManager, login_user, current_user, logout_user, login_required
+from werkzeug.security import generate_password_hash, check_password_hash
+import os
+import secrets
+from PIL import Image
+
+# Inicializa a aplicação Flask
+app = Flask(__name__)
+# Carrega as configurações do arquivo config.py
+app.config.from_object(Config)
+
+# Inicializa o SQLAlchemy com a aplicação Flask
+db.init_app(app)
+
+# Configura o Flask-Login
+login_manager = LoginManager(app)
+login_manager.login_view = 'login' # Define a rota para onde o usuário será redirecionado se não estiver logado
+
+# Função para carregar o usuário pelo ID, necessária para o Flask-Login
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# Função auxiliar para salvar a imagem de capa
+def save_cover_image(image_file):
+    # Gera um nome de arquivo aleatório para evitar colisões
+    random_hex = secrets.token_hex(8)
+    # Extrai a extensão do arquivo original
+    _, f_ext = os.path.splitext(image_file.filename)
+    # Cria o nome completo do arquivo
+    picture_fn = random_hex + f_ext
+    # Define o caminho completo onde a imagem será salva
+    picture_path = os.path.join(app.root_path, app.config['UPLOAD_FOLDER'], picture_fn)
+
+    # Redimensiona a imagem para um tamanho padrão (opcional, mas recomendado para otimização)
+    output_size = (400, 400)
+    i = Image.open(image_file)
+    i.thumbnail(output_size)
+    # Salva a imagem no caminho especificado
+    i.save(picture_path)
+
+    # Retorna o nome do arquivo gerado
+    return picture_fn
+
+# --- Rotas da Aplicação ---
+
+# Rota para a página inicial
+@app.route("/")
+@app.route("/home")
+def home():
+    # Busca todas as histórias, ordenadas pela data de publicação mais recente
+    stories = Story.query.order_by(Story.date_posted.desc()).all()
+    # Renderiza o template index.html, passando as histórias para exibição
+    return render_template('index.html', stories=stories)
+
+# Rota para o registro de novos usuários
+@app.route("/register", methods=['GET', 'POST'])
+def register():
+    # Se o usuário já estiver autenticado, redireciona para a página inicial
+    if current_user.is_authenticated:
+        return redirect(url_for('home'))
+    # Cria uma instância do formulário de registro
+    form = RegistrationForm()
+    # Se o formulário for submetido e validado
+    if form.validate_on_submit():
+        # Gera o hash da senha para segurança
+        hashed_password = generate_password_hash(form.password.data)
+        # Cria um novo objeto User com os dados do formulário
+        user = User(username=form.username.data, email=form.email.data,
+                    password=hashed_password, is_author=form.is_author.data)
+        # Adiciona o novo usuário ao banco de dados e comita a transação
+        db.session.add(user)
+        db.session.commit()
+        # Exibe uma mensagem de sucesso para o usuário
+        flash('Sua conta foi criada com sucesso! Você pode agora fazer login.', 'success')
+        # Redireciona para a página de login
+        return redirect(url_for('login'))
+    # Renderiza o template register.html, passando o formulário
+    return render_template('register.html', title='Registrar', form=form)
+
+# Rota para o login de usuários
+@app.route("/login", methods=['GET', 'POST'])
+def login():
+    # Se o usuário já estiver autenticado, redireciona para a página inicial
+    if current_user.is_authenticated:
+        return redirect(url_for('home'))
+    # Cria uma instância do formulário de login
+    form = LoginForm()
+    # Se o formulário for submetido e validado
+    if form.validate_on_submit():
+        # Busca o usuário no banco de dados pelo email
+        user = User.query.filter_by(email=form.email.data).first()
+        # Verifica se o usuário existe e se a senha está correta
+        if user and check_password_hash(user.password, form.password.data):
+            # Faz o login do usuário usando Flask-Login
+            login_user(user)
+            # Redireciona para a próxima página se houver uma, caso contrário para a home
+            next_page = request.args.get('next')
+            flash('Login bem-sucedido!', 'success')
+            return redirect(next_page) if next_page else redirect(url_for('home'))
+        else:
+            # Exibe uma mensagem de erro se o login falhar
+            flash('Login falhou. Por favor, verifique seu email e senha.', 'danger')
+    # Renderiza o template login.html, passando o formulário
+    return render_template('login.html', title='Login', form=form)
+
+# Rota para o logout de usuários
+@app.route("/logout")
+def logout():
+    # Faz o logout do usuário usando Flask-Login
+    logout_user()
+    # Redireciona para a página inicial
+    return redirect(url_for('home'))
+
+# Rota para a criação de novas histórias (apenas para autores logados)
+@app.route("/story/new", methods=['GET', 'POST'])
+@login_required # Requer que o usuário esteja logado
+def create_story():
+    # Verifica se o usuário logado é um autor
+    if not current_user.is_author:
+        flash('Você precisa ser um autor para criar histórias.', 'danger')
+        return redirect(url_for('home'))
+    # Cria uma instância do formulário de história
+    form = StoryForm()
+    # Se o formulário for submetido e validado
+    if form.validate_on_submit():
+        cover_image_file = None
+        # Se uma imagem de capa foi enviada, salva-a
+        if form.cover_image.data:
+            cover_image_file = save_cover_image(form.cover_image.data)
+        # Cria um novo objeto Story com os dados do formulário e o autor atual
+        story = Story(title=form.title.data, description=form.description.data,
+                      cover_image=cover_image_file, author=current_user)
+        # Adiciona a nova história ao banco de dados e comita a transação
+        db.session.add(story)
+        db.session.commit()
+        # Exibe uma mensagem de sucesso
+        flash('Sua história foi criada!', 'success')
+        # Redireciona para a página inicial
+        return redirect(url_for('home'))
+    # Renderiza o template create_story.html, passando o formulário
+    return render_template('create_story.html', title='Nova História', form=form, legend='Nova História')
+
+# Rota para exibir os detalhes de uma história específica
+@app.route("/story/<int:story_id>")
+def story(story_id):
+    # Busca a história pelo ID ou retorna 404 se não encontrada
+    story = Story.query.get_or_404(story_id)
+    # Cria uma instância do formulário de comentário
+    form = CommentForm()
+    # Busca todos os comentários associados a esta história, ordenados do mais recente para o mais antigo
+    comments = Comment.query.filter_by(story_id=story_id).order_by(Comment.date_posted.desc()).all()
+    # Renderiza o template story_detail.html, passando a história, o formulário e os comentários
+    return render_template('story_detail.html', title=story.title, story=story, form=form, comments=comments)
+
+# Rota para adicionar um comentário a uma história (apenas para usuários logados)
+@app.route("/story/<int:story_id>/comment", methods=['POST'])
+@login_required # Requer que o usuário esteja logado
+def add_comment(story_id):
+    # Busca a história pelo ID ou retorna 404 se não encontrada
+    story = Story.query.get_or_404(story_id)
+    # Cria uma instância do formulário de comentário
+    form = CommentForm()
+    # Se o formulário for submetido e validado
+    if form.validate_on_submit():
+        # Cria um novo objeto Comment com o conteúdo, o autor atual e a história
+        comment = Comment(content=form.content.data, comment_author=current_user, story=story)
+        # Adiciona o novo comentário ao banco de dados e comita a transação
+        db.session.add(comment)
+        db.session.commit()
+        # Exibe uma mensagem de sucesso
+        flash('Seu comentário foi adicionado!', 'success')
+    else:
+        # Se houver erros de validação, exibe-os
+        for field, errors in form.errors.items():
+            for error in errors:
+                flash(f"Erro no campo '{field}': {error}", 'danger')
+    # Redireciona de volta para a página de detalhes da história
+    return redirect(url_for('story', story_id=story.id))
+
+# Bloco para rodar a aplicação
+if __name__ == '__main__':
+    # Cria as tabelas do banco de dados se elas não existirem
+    with app.app_context():
+        db.create_all()
+    # Inicia o servidor de desenvolvimento do Flask
+    app.run(debug=True) # debug=True ativa o modo de depuração (recarregamento automático, etc.)
+
+```python
+# config.py
+# Este arquivo contém as configurações da sua aplicação Flask.
+
+import os
+
+class Config:
+    # Chave secreta para segurança da sessão e CSRF.
+    # É crucial que esta chave seja forte e não seja exposta em produção.
+    # Em produção, você deve usar uma variável de ambiente (os.environ.get).
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'uma-chave-muito-secreta-e-dificil-de-adivinhar'
+
+    # URI do banco de dados. Usamos SQLite para simplicidade neste exemplo.
+    # Em produção, você usaria um banco de dados como PostgreSQL ou MySQL.
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///site.db'
+
+    # Desativa o rastreamento de modificações do SQLAlchemy para economizar recursos.
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+    # Define a pasta onde as imagens de upload serão salvas.
+    # os.path.abspath(os.path.dirname(__file__)) obtém o diretório atual do arquivo config.py.
+    UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static/uploads')
+
+    # Define o tamanho máximo permitido para uploads de arquivos (16 MB neste caso).
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+```python
+# models.py
+# Este arquivo define os modelos de banco de dados usando Flask-SQLAlchemy.
+
+from datetime import datetime
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+
+# Cria uma instância do SQLAlchemy. Ela será inicializada com a aplicação Flask em app.py.
+db = SQLAlchemy()
+
+# Modelo para o Usuário
+class User(db.Model, UserMixin):
+    # Colunas da tabela de usuários
+    id = db.Column(db.Integer, primary_key=True) # Chave primária auto-incrementável
+    username = db.Column(db.String(20), unique=True, nullable=False) # Nome de usuário, único e obrigatório
+    email = db.Column(db.String(120), unique=True, nullable=False) # Email, único e obrigatório
+    password = db.Column(db.String(60), nullable=False) # Senha (hash), obrigatória
+    is_author = db.Column(db.Boolean, default=False) # Indica se o usuário é um autor (padrão: False)
+
+    # Relacionamento com o modelo Story: um usuário pode ter muitas histórias
+    # 'backref' cria uma referência 'author' no modelo Story, permitindo acessar o autor de uma história.
+    # 'lazy=True' significa que as histórias serão carregadas sob demanda.
+    stories = db.relationship('Story', backref='author', lazy=True)
+
+    # Relacionamento com o modelo Comment: um usuário pode fazer muitos comentários
+    # 'backref' cria uma referência 'comment_author' no modelo Comment.
+    comments = db.relationship('Comment', backref='comment_author', lazy=True)
+
+    # Método __repr__ para representação amigável do objeto User
+    def __repr__(self):
+        return f"User('{self.username}', '{self.email}')"
+
+# Modelo para a História
+class Story(db.Model):
+    # Colunas da tabela de histórias
+    id = db.Column(db.Integer, primary_key=True) # Chave primária
+    title = db.Column(db.String(100), nullable=False) # Título da história, obrigatório
+    description = db.Column(db.Text, nullable=False) # Descrição da história, obrigatória (TEXT para textos longos)
+    cover_image = db.Column(db.String(200), nullable=True) # Nome do arquivo da imagem de capa (opcional)
+    date_posted = db.Column(db.DateTime, nullable=False, default=datetime.utcnow) # Data de publicação (UTC)
+
+    # Chave estrangeira para o modelo User: uma história pertence a um usuário (autor)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+    # Relacionamento com o modelo Comment: uma história pode ter muitos comentários
+    # 'cascade="all, delete-orphan"' garante que os comentários sejam deletados se a história for deletada.
+    comments = db.relationship('Comment', backref='story', lazy=True, cascade="all, delete-orphan")
+
+    # Método __repr__ para representação amigável do objeto Story
+    def __repr__(self):
+        return f"Story('{self.title}', '{self.date_posted}')"
+
+# Modelo para o Comentário
+class Comment(db.Model):
+    # Colunas da tabela de comentários
+    id = db.Column(db.Integer, primary_key=True) # Chave primária
+    content = db.Column(db.Text, nullable=False) # Conteúdo do comentário, obrigatório
+    date_posted = db.Column(db.DateTime, nullable=False, default=datetime.utcnow) # Data de publicação (UTC)
+
+    # Chave estrangeira para o modelo User: um comentário é feito por um usuário
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    # Chave estrangeira para o modelo Story: um comentário pertence a uma história
+    story_id = db.Column(db.Integer, db.ForeignKey('story.id'), nullable=False)
+
+    # Método __repr__ para representação amigável do objeto Comment
+    def __repr__(self):
+        return f"Comment('{self.content[:20]}...')"
+```python
+# forms.py
+# Este arquivo define os formulários da sua aplicação usando Flask-WTF.
+
+from flask_wtf import FlaskForm
+from flask_wtf.file import FileField, FileAllowed # Para campos de upload de arquivo
+from wtforms import StringField, PasswordField, SubmitField, TextAreaField, BooleanField
+from wtforms.validators import DataRequired, Length, Email, EqualTo, ValidationError # Validadores
+from models import User # Importa o modelo User para validações personalizadas
+
+# Formulário de Registro de Usuário
+class RegistrationForm(FlaskForm):
+    username = StringField('Nome de Usuário',
+                           validators=[DataRequired(), Length(min=2, max=20)])
+    email = StringField('Email',
+                        validators=[DataRequired(), Email()])
+    password = PasswordField('Senha', validators=[DataRequired()])
+    confirm_password = PasswordField('Confirmar Senha',
+                                     validators=[DataRequired(), EqualTo('password', message='As senhas devem ser iguais.')])
+    is_author = BooleanField('Sou Autor') # Checkbox para indicar se o usuário é um autor
+    submit = SubmitField('Registrar')
+
+    # Validação personalizada para verificar se o nome de usuário já existe
+    def validate_username(self, username):
+        user = User.query.filter_by(username=username.data).first()
+        if user:
+            raise ValidationError('Esse nome de usuário já está em uso. Por favor, escolha outro.')
+
+    # Validação personalizada para verificar se o email já existe
+    def validate_email(self, email):
+        user = User.query.filter_by(email=email.data).first()
+        if user:
+            raise ValidationError('Esse email já está em uso. Por favor, escolha outro.')
+
+# Formulário de Login de Usuário
+class LoginForm(FlaskForm):
+    email = StringField('Email',
+                        validators=[DataRequired(), Email()])
+    password = PasswordField('Senha', validators=[DataRequired()])
+    submit = SubmitField('Login')
+
+# Formulário para Criar/Editar História
+class StoryForm(FlaskForm):
+    title = StringField('Título da História',
+                        validators=[DataRequired(), Length(min=5, max=100)])
+    description = TextAreaField('Descrição da História',
+                                validators=[DataRequired()])
+    # Campo para upload de imagem de capa, permitindo apenas JPG, PNG e JPEG
+    cover_image = FileField('Imagem de Capa (Opcional)',
+                            validators=[FileAllowed(['jpg', 'png', 'jpeg'], 'Apenas imagens JPG, PNG ou JPEG são permitidas.')])
+    submit = SubmitField('Publicar História')
+
+# Formulário para Adicionar Comentário
+class CommentForm(FlaskForm):
+    content = TextAreaField('Seu Comentário',
+                            validators=[DataRequired()])
+    submit = SubmitField('Enviar Comentário')
+```html
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meu Site de Leitura - {% block title %}{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header>
+        <nav>
+            <a href="{{ url_for('home') }}">Meu Site de Leitura</a>
+            <div>
+                {% if current_user.is_authenticated %}
+                    {% if current_user.is_author %}
+                        <a href="{{ url_for('create_story') }}">Nova História</a>
+                    {% endif %}
+                    <a href="{{ url_for('logout') }}">Sair</a>
+                {% else %}
+                    <a href="{{ url_for('login') }}">Login</a>
+                    <a href="{{ url_for('register') }}">Registrar</a>
+                {% endif %}
+            </div>
+        </nav>
+    </header>
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <ul class="flashes">
+                    {% for category, message in messages %}
+                        <li class="{{ category }}">{{ message }}</li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+    </main>
+    <footer>
+        <p>&copy; 2025 Meu Site de Leitura</p>
+    </footer>
+</body>
+</html>
+```html
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+    <h1>Últimas Histórias</h1>
+    <div class="stories-list">
+        {% for story in stories %}
+            <article class="story-card">
+                {% if story.cover_image %}
+                    <img src="{{ url_for('static', filename='uploads/' + story.cover_image) }}" alt="Capa da História" class="story-cover">
+                {% else %}
+                    <img src="{{ url_for('static', filename='img/default_cover.png') }}" alt="Capa Padrão" class="story-cover">
+                {% endif %}
+                <h2><a href="{{ url_for('story', story_id=story.id) }}">{{ story.title }}</a></h2>
+                <p class="story-author">Por: {{ story.author.username }}</p>
+                <p>{{ story.description[:150] }}...</p>
+                <a href="{{ url_for('story', story_id=story.id) }}" class="read-more">Leia Mais</a>
+            </article>
+        {% else %}
+            <p>Nenhuma história publicada ainda.</p>
+        {% endfor %}
+    </div>
+{% endblock content %}
+```html
+{% extends "base.html" %}
+{% block title %}Registrar{% endblock %}
+{% block content %}
+    <div class="form-container">
+        <h2>Registrar</h2>
+        <form method="POST" action="">
+            {{ form.csrf_token }}
+            <div class="form-group">
+                {{ form.username.label }}
+                {{ form.username() }}
+                {% if form.username.errors %}
+                    <ul class="errors">
+                        {% for error in form.username.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.email.label }}
+                {{ form.email() }}
+                {% if form.email.errors %}
+                    <ul class="errors">
+                        {% for error in form.email.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.password.label }}
+                {{ form.password() }}
+                {% if form.password.errors %}
+                    <ul class="errors">
+                        {% for error in form.password.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.confirm_password.label }}
+                {{ form.confirm_password() }}
+                {% if form.confirm_password.errors %}
+                    <ul class="errors">
+                        {% for error in form.confirm_password.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group checkbox">
+                {{ form.is_author() }}
+                {{ form.is_author.label }}
+            </div>
+            <div class="form-group">
+                {{ form.submit() }}
+            </div>
+        </form>
+    </div>
+{% endblock content %}
+```html
+{% extends "base.html" %}
+{% block title %}Login{% endblock %}
+{% block content %}
+    <div class="form-container">
+        <h2>Login</h2>
+        <form method="POST" action="">
+            {{ form.csrf_token }}
+            <div class="form-group">
+                {{ form.email.label }}
+                {{ form.email() }}
+                {% if form.email.errors %}
+                    <ul class="errors">
+                        {% for error in form.email.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.password.label }}
+                {{ form.password() }}
+                {% if form.password.errors %}
+                    <ul class="errors">
+                        {% for error in form.password.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.submit() }}
+            </div>
+        </form>
+    </div>
+{% endblock content %}
+```html
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+    <div class="form-container">
+        <h2>{{ legend }}</h2>
+        <form method="POST" action="" enctype="multipart/form-data">
+            {{ form.csrf_token }}
+            <div class="form-group">
+                {{ form.title.label }}
+                {{ form.title() }}
+                {% if form.title.errors %}
+                    <ul class="errors">
+                        {% for error in form.title.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.description.label }}
+                {{ form.description() }}
+                {% if form.description.errors %}
+                    <ul class="errors">
+                        {% for error in form.description.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.cover_image.label }}
+                {{ form.cover_image() }}
+                {% if form.cover_image.errors %}
+                    <ul class="errors">
+                        {% for error in form.cover_image.errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                {{ form.submit() }}
+            </div>
+        </form>
+    </div>
+{% endblock content %}
+```html
+{% extends "base.html" %}
+{% block title %}{{ story.title }}{% endblock %}
+{% block content %}
+    <article class="story-detail">
+        {% if story.cover_image %}
+            <img src="{{ url_for('static', filename='uploads/' + story.cover_image) }}" alt="Capa da História" class="story-cover-detail">
+        {% else %}
+            <img src="{{ url_for('static', filename='img/default_cover.png') }}" alt="Capa Padrão" class="story-cover-detail">
+        {% endif %}
+        <h1>{{ story.title }}</h1>
+        <p class="story-meta">Por: {{ story.author.username }} em {{ story.date_posted.strftime('%d/%m/%Y') }}</p>
+        <div class="story-content">
+            <p>{{ story.description }}</p>
+        </div>
+    </article>
+
+    <hr>
+
+    <div class="comments-section">
+        <h3>Comentários</h3>
+        {% if current_user.is_authenticated %}
+            <div class="comment-form-container">
+                <form method="POST" action="{{ url_for('add_comment', story_id=story.id) }}">
+                    {{ form.csrf_token }}
+                    <div class="form-group">
+                        {{ form.content.label }}
+                        {{ form.content() }}
+                        {% if form.content.errors %}
+                            <ul class="errors">
+                                {% for error in form.content.errors %}
+                                    <li>{{ error }}</li>
+                                {% endfor %}
+                            </ul>
+                        {% endif %}
+                    </div>
+                    <div class="form-group">
+                        {{ form.submit() }}
+                    </div>
+                </form>
+            </div>
+        {% else %}
+            <p>Faça <a href="{{ url_for('login') }}">login</a> para deixar um comentário.</p>
+        {% endif %}
+
+        <div class="comments-list">
+            {% for comment in comments %}
+                <div class="comment-card">
+                    <p class="comment-author-info"><strong>{{ comment.comment_author.username }}</strong> em {{ comment.date_posted.strftime('%d/%m/%Y %H:%M') }}</p>
+                    <p class="comment-content">{{ comment.content }}</p>
+                </div>
+            {% else %}
+                <p>Nenhum comentário ainda. Seja o primeiro a comentar!</p>
+            {% endfor %}
+        </div>
+    </div>
+{% endblock %}
+```css
+/* static/css/style.css */
+/* Este arquivo contém os estilos CSS para a sua aplicação. */
+
+body {
+    font-family: 'Inter', sans-serif; /* Usando Inter como fonte padrão */
+    margin: 0;
+    padding: 0;
+    background-color: #f0f2f5; /* Cor de fundo suave */
+    color: #333;
+    line-height: 1.6;
+}
+
+header {
+    background-color: #2c3e50; /* Azul escuro */
+    color: white;
+    padding: 1rem 0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+header nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+}
+
+header nav a {
+    color: white;
+    text-decoration: none;
+    margin: 0 15px;
+    font-weight: 500;
+    transition: color 0.3s ease;
+}
+
+header nav a:hover {
+    color: #a0c4ff; /* Azul claro ao passar o mouse */
+}
+
+main {
+    max-width: 1200px;
+    margin: 30px auto;
+    padding: 0 1.5rem;
+}
+
+.flashes {
+    list-style: none;
+    padding: 15px;
+    margin-bottom: 25px;
+    border-radius: 8px;
+    font-weight: 500;
+}
+
+.flashes li {
+    padding: 12px;
+    margin-bottom: 10px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+}
+
+.flashes .success {
+    background-color: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+}
+
+.flashes .danger {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+}
+
+.form-container {
+    background-color: white;
+    padding: 30px;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    max-width: 550px;
+    margin: 0 auto;
+}
+
+.form-container h2 {
+    text-align: center;
+    color: #2c3e50;
+    margin-bottom: 25px;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: #555;
+}
+
+.form-group input[type="text"],
+.form-group input[type="email"],
+.form-group input[type="password"],
+.form-group textarea,
+.form-group input[type="file"] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    box-sizing: border-box;
+    font-size: 1rem;
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.form-group input[type="text"]:focus,
+.form-group input[type="email"]:focus,
+.form-group input[type="password"]:focus,
+.form-group textarea:focus,
+.form-group input[type="file"]:focus {
+    border-color: #a0c4ff;
+    box-shadow: 0 0 0 3px rgba(160, 196, 255, 0.5);
+    outline: none;
+}
+
+.form-group textarea {
+    min-height: 120px;
+    resize: vertical;
+}
+
+.form-group input[type="submit"] {
+    background-color: #2c3e50;
+    color: white;
+    padding: 12px 25px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1.1rem;
+    font-weight: 600;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+    width: 100%;
+}
+
+.form-group input[type="submit"]:hover {
+    background-color: #34495e;
+    transform: translateY(-2px);
+}
+
+.form-group.checkbox {
+    display: flex;
+    align-items: center;
+    margin-top: -10px; /* Ajuste para alinhar melhor com outros campos */
+    margin-bottom: 25px;
+}
+
+.form-group.checkbox input[type="checkbox"] {
+    margin-right: 10px;
+    width: auto;
+    transform: scale(1.2); /* Aumenta o tamanho do checkbox */
+}
+
+ul.errors {
+    list-style: none;
+    padding: 0;
+    color: #e74c3c; /* Vermelho vibrante para erros */
+    font-size: 0.85em;
+    margin-top: 5px;
+    margin-left: 0;
+}
+
+.stories-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 30px;
+}
+
+.story-card {
+    background-color: white;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.08);
+    text-align: center;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.story-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 6px 12px rgba(0,0,0,0.12);
+}
+
+.story-card .story-cover {
+    max-width: 100%;
+    height: 220px; /* Altura fixa para as capas */
+    object-fit: cover; /* Recorta a imagem para preencher o espaço */
+    border-radius: 8px;
+    margin-bottom: 18px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.story-card h2 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    font-size: 1.4rem;
+}
+
+.story-card h2 a {
+    color: #2c3e50;
+    text-decoration: none;
+    transition: color 0.3s ease;
+}
+
+.story-card h2 a:hover {
+    color: #3498db; /* Azul mais claro ao passar o mouse */
+}
+
+.story-author {
+    font-size: 0.95em;
+    color: #7f8c8d; /* Cinza suave */
+    margin-top: 5px;
+    margin-bottom: 15px;
+}
+
+.read-more {
+    display: inline-block;
+    background-color: #3498db; /* Azul vibrante */
+    color: white;
+    padding: 10px 20px;
+    border-radius: 6px;
+    text-decoration: none;
+    margin-top: 20px;
+    font-weight: 500;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+}
+
+.read-more:hover {
+    background-color: #2980b9;
+    transform: translateY(-2px);
+}
+
+.story-detail {
+    background-color: white;
+    padding: 40px;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    margin-bottom: 30px;
+}
+
+.story-detail .story-cover-detail {
+    max-width: 500px;
+    height: auto;
+    display: block;
+    margin: 0 auto 30px auto;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+}
+
+.story-detail h1 {
+    text-align: center;
+    margin-bottom: 15px;
+    color: #2c3e50;
+    font-size: 2.2rem;
+}
+
+.story-detail .story-meta {
+    text-align: center;
+    font-size: 1em;
+    color: #7f8c8d;
+    margin-bottom: 30px;
+}
+
+.story-content {
+    line-height: 1.8;
+    font-size: 1.1rem;
+    color: #444;
+    white-space: pre-wrap; /* Preserva quebras de linha e espaços do textarea */
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #eee;
+    margin: 40px 0;
+}
+
+.comments-section {
+    background-color: white;
+    padding: 40px;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+.comments-section h3 {
+    margin-bottom: 25px;
+    color: #2c3e50;
+    font-size: 1.8rem;
+}
+
+.comment-form-container {
+    margin-bottom: 35px;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 25px;
+}
+
+.comment-card {
+    border: 1px solid #e0e0e0;
+    background-color: #fafafa;
+    padding: 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
+.comment-author-info {
+    font-size: 0.95em;
+    color: #555;
+    margin-bottom: 8px;
+}
+
+.comment-author-info strong {
+    color: #2c3e50;
+}
+
+.comment-content {
+    line-height: 1.6;
+    color: #333;
+}
+
+footer {
+    text-align: center;
+    padding: 1.5rem 0;
+    margin-top: 40px;
+    background-color: #2c3e50;
+    color: white;
+    font-size: 0.9em;
+}
